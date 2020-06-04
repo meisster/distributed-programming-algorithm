@@ -42,24 +42,29 @@ struct ProcessRequest {
 
 static int MYSELF;
 static int SIZE;
-static int messages_received = 0;
-static std::map<int, ProcessData> processes_map;
+static int MESSAGES_RECEIVED = 0;
+static std::map<int, ProcessData> PROCESSES_MAP;
 static Response MY_DEMAND;
+std::vector<ProcessRequest> REQS;
+std::vector<ProcessRequest> ACKS;
+std::vector<ProcessRequest> RELEASES;
+std::vector<ProcessData> RESPONSES;
+
 long long now();
 
 int atLeastOne();
 
-void init(ProcessRequest *table);
+void init(std::vector<ProcessRequest> *table);
 
 void sleepMillis(int millis);
 
-void checkREQ(ProcessRequest *requests, bool *notFinished);
+void checkREQ(bool *notFinished);
 
-void checkACK(ProcessRequest *requests, bool *notFinished);
+void checkACK(bool *notFinished);
 
-void checkRELEASE(ProcessRequest *requests, bool *notFinished);
+void checkRELEASE(bool *notFinished);
 
-void initRespones(ProcessData *responses);
+void initRespones();
 
 void initProcessMap();
 
@@ -70,19 +75,15 @@ void demandRooms();
 using namespace std;
 
 int main(int argc, char **argv) {
+    srand((unsigned) time(nullptr) + MYSELF);
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &MYSELF);
     MPI_Comm_size(MPI_COMM_WORLD, &SIZE);
-    srand((unsigned) time(nullptr) + MYSELF);
-    ProcessRequest REQS[SIZE];
-    ProcessRequest ACKS[SIZE];
-    ProcessRequest RELEASES[SIZE];
-    ProcessData responses[SIZE];
-    init(REQS);
-    init(ACKS);
-    init(RELEASES);
+    init(&REQS);
+    init(&ACKS);
+    init(&RELEASES);
     initProcessMap();
-    initRespones(responses);
+    initRespones();
 
     // send initial data
     demandRooms();
@@ -99,9 +100,9 @@ int main(int argc, char **argv) {
     // main loop
     auto notFinished = true;
     while (notFinished) {
-        checkREQ(REQS, &notFinished);
-        checkACK(ACKS, &notFinished);
-        checkRELEASE(RELEASES, &notFinished);
+        checkREQ(&notFinished);
+        checkACK(&notFinished);
+        checkRELEASE(&notFinished);
 
         if (notFinished) {
             sleepMillis(100);
@@ -109,61 +110,72 @@ int main(int argc, char **argv) {
     }
 
     printf("[#%d] I finished!\n", MYSELF);
-    for (auto const&[key, value] : processes_map) {
+    for (auto const&[key, value] : PROCESSES_MAP) {
         cout << "[" << MYSELF << "] Process #" << key << " rooms=[" << value.rooms << "],ack=["
              << value.received_ack << "]" << endl;
     }
     MPI_Finalize();
 }
 
-void checkREQ(ProcessRequest *requests, bool *notFinished) {
+void checkREQ(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
         MPI_Status status;
         if (process_id != MYSELF) {
-            MPI_Test(&requests[process_id].request, &requestFinished, &status);
+            MPI_Test(&REQS[process_id].request, &requestFinished, &status);
             if (requestFinished) {
-                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "REQ", requests[process_id].response.data,
+                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "REQ", REQS[process_id].response.data,
                        process_id);
-                auto process = processes_map.find(process_id);
-                process->second.rooms = requests[process_id].response.data;
-                messages_received++;
+                auto process = PROCESSES_MAP.find(process_id);
+                process->second.rooms = REQS[process_id].response.data;
+                MESSAGES_RECEIVED++;
             }
         }
     }
-    *notFinished = messages_received != SIZE - 1;
+    *notFinished = MESSAGES_RECEIVED != SIZE - 1;
 }
 
-void checkACK(ProcessRequest *requests, bool *notFinished) {
+void checkACK(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
         MPI_Status status;
         if (process_id != MYSELF) {
-            MPI_Test(&requests[process_id].request, &requestFinished, &status);
+            MPI_Test(&ACKS[process_id].request, &requestFinished, &status);
             if (requestFinished) {
-                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "ACK", requests[process_id].response.data,
+                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "ACK", ACKS[process_id].response.data,
                        process_id);
-                auto process = processes_map.find(process_id);
-                process->second.received_ack = requests[process_id].response.data;
-                messages_received++;
+                auto process = PROCESSES_MAP.find(process_id);
+                process->second.received_ack = ACKS[process_id].response.data;
+                MESSAGES_RECEIVED++;
             }
         }
     }
 }
 
-void checkRELEASE(ProcessRequest *requests, bool *notFinished) {
+void checkRELEASE(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
         MPI_Status status;
         if (process_id != MYSELF) {
-            MPI_Test(&requests[process_id].request, &requestFinished, &status);
+            MPI_Test(&RELEASES[process_id].request, &requestFinished, &status);
             if (requestFinished) {
-                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "RELEASE", requests[process_id].response.data,
+                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "RELEASE", RELEASES[process_id].response.data,
                        process_id);
-                auto process = processes_map.find(process_id);
-                process->second.rooms -= requests[process_id].response.data;
-                messages_received++;
+                auto process = PROCESSES_MAP.find(process_id);
+                process->second.rooms -= RELEASES[process_id].response.data;
+                MESSAGES_RECEIVED++;
             }
+        }
+    }
+}
+
+void demandRooms() {
+    Response demand = Response(now(), atLeastOne());
+    MY_DEMAND = demand;
+    for (int destination = 0; destination < SIZE; destination++) {
+        if (destination != MYSELF) {
+            printf("[#%d][%s] Sending %d to #%d\n", MYSELF, "REQ", demand.data, destination);
+            MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, REQ, MPI_COMM_WORLD);
         }
     }
 }
@@ -178,22 +190,22 @@ void listenFor(int TAG, ProcessRequest *process) {
 void initProcessMap() {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         auto d = ProcessData();
-        processes_map.insert({process_id, d});
+        PROCESSES_MAP.insert({process_id, d});
     }
 }
 
-void init(ProcessRequest *table) {
-    table = new ProcessRequest[SIZE];
+void init(std::vector<ProcessRequest> *table) {
+    table->resize(SIZE);
     for (int process_id = 0; process_id < SIZE; process_id++) {
-        table[process_id].request = MPI_REQUEST_NULL;
-        table[process_id].response = {};
+        table->at(process_id).request = MPI_REQUEST_NULL;
+        table->at(process_id).response = {};
     }
 }
 
-void initRespones(ProcessData *responses) {
-    responses = new ProcessData[SIZE];
+void initRespones() {
+    RESPONSES.resize(SIZE);
     for (int process_id = 0; process_id < SIZE; process_id++) {
-        responses[process_id] = {};
+        RESPONSES[process_id] = {};
     }
 }
 
@@ -208,16 +220,5 @@ void sleepMillis(int millis) {
 long long now() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();;
-}
-
-void demandRooms() {
-    Response demand = Response(now(), atLeastOne());
-    MY_DEMAND = demand;
-    for (int destination = 0; destination < SIZE; destination++) {
-        if (destination != MYSELF) {
-            printf("[#%d][%s] Sending %d to #%d\n", MYSELF, "REQ", demand.data, destination);
-            MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, REQ, MPI_COMM_WORLD);
-        }
-    }
 }
 
