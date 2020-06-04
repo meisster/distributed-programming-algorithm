@@ -1,0 +1,3 @@
+C:/Users/Meisster/Desktop/szafa/cmake-build-debug/CMakeFiles/szafa.dir
+C:/Users/Meisster/Desktop/szafa/cmake-build-debug/CMakeFiles/edit_cache.dir
+C:/Users/Meisster/Desktop/szafa/cmake-build-debug/CMakeFiles/rebuild_cache.dir
