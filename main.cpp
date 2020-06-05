@@ -12,6 +12,7 @@
 #define REQ 2
 #define RELEASE 3
 #define MAX_ROOMS 10
+#define TIMEOUT 6
 
 struct Response {
     Response() = default;
@@ -130,25 +131,26 @@ int main(int argc, char **argv) {
     auto start = chrono::steady_clock::now();
 
     while (!finished && !timeout) {
-        auto end = chrono::steady_clock::now();
-        timeout = chrono::duration_cast<chrono::seconds>(end - start).count() > 2;
-        if (timeout) {
-            printf("Timeout!\n");
-        }
         checkREQ(&finished);
         checkACK(&finished);
         checkRELEASE(&finished);
         if (MESSAGES_RECEIVED >= (SIZE - 1)) {
             tryToOccupyRooms(&finished);
         }
-        if (!finished) {
+
+        auto end = chrono::steady_clock::now();
+        timeout = chrono::duration_cast<chrono::seconds>(end - start).count() > TIMEOUT;
+        if (!finished & !timeout) {
             sleepMillis(100);
+        }
+        if (timeout) {
+            printf("[#%d][INFO]Timeout!\n", MYSELF);
         }
     }
 
     for (auto const&[key, value] : PROCESSES_MAP) {
         if (key != MYSELF) {
-            cout << "[#" << MYSELF << "] Process #" << key << " rooms=[" << value.rooms << "],ack=["
+            cout << "[#" << MYSELF << "][INFO] Process #" << key << " rooms=[" << value.rooms << "],ack=["
                  << value.received_ack << "]" << endl;
         }
     }
@@ -169,28 +171,15 @@ void tryToOccupyRooms(bool *finished) {
             }
         }
     }
+    printf("[#%d][OCCUPY] ROOMS_WANTED=[%d], ACKS_ACQUIRED=[%d]\n", MYSELF, ROOMS_WANTED, ACKS_ACQUIRED);
     if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn) {
-        printf("[#%d][OCCUPY] ROOMS_WANTED=[%d], ACKS_ACQUIRED=[%d]\n", MYSELF, ROOMS_WANTED, ACKS_ACQUIRED);
-        printf("[#%d][OCCUPY] I have taken the rooms=[%d]! Going to sleep for 5 seconds\n", MYSELF, MY_DEMAND.data);
+        printf("[#%d][OCCUPY] I have taken the rooms=[%d]! Going to sleep for 2 seconds\n", MYSELF, MY_DEMAND.data);
         *finished = true;
-        sleepMillis(5000);
+        sleepMillis(2000);
         sendRELEASE();
     } else {
         printf("[#%d][OCCUPY] Cannot occupy room, waiting...\n", MYSELF);
         sleepMillis(1000);
-    }
-}
-
-void sendRELEASE() {
-    Response demand = Response(now(), MY_DEMAND.data);
-    ROOMS_WANTED -= demand.data;
-    MY_DEMAND = {}; // will it work?
-    for (int destination = 0; destination < SIZE; destination++) {
-        if (destination != MYSELF) {
-            printf("[#%d][%s][SEND] Sending RELEASE %d to #%d\n", MYSELF, "RELEASE", demand.data, destination);
-            MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, RELEASE, MPI_COMM_WORLD);
-//            listenFor(ACK, &ACKS[destination], destination); // will it work?
-        }
     }
 }
 
@@ -209,7 +198,6 @@ void checkREQ(bool *notFinished) {
                 PROCESSES_MAP.find(process_id)->second.timestamp = REQS[process_id].response.timestamp;
                 ROOMS_WANTED += REQS[process_id].response.data;
                 if (REQS[process_id].response.timestamp < MY_DEMAND.timestamp) {
-                    printf("[#%d][REQ] Got request with higher priority, sending ACK to #%d\n", MYSELF, process_id);
                     sendACK(process_id);
                 }
             }
@@ -238,8 +226,9 @@ void checkRELEASE(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
         if (process_id != MYSELF) {
+            printf("[#%d][%s][CHECK] Checking for RELEASE from #%d current=%d\n", MYSELF, "RELEASE", process_id, RELEASES[process_id].response.data);
             MPI_Test(&RELEASES[process_id].request, &requestFinished, MPI_STATUS_IGNORE);
-            if (requestFinished && !RELEASES[process_id].requestCompleted) {
+            if (requestFinished) {
                 printf("[#%d][%s][RECEIVE] Received %d_%lld from #%d\n", MYSELF, "RELEASE", RELEASES[process_id].response.data,
                        RELEASES[process_id].response.timestamp,
                        process_id);
@@ -253,12 +242,26 @@ void checkRELEASE(bool *notFinished) {
 
 void sendACK(int destination) {
     auto response = Response(now(), true);
+    printf("[#%d][ACK][SEND] Sending ACK to #%d\n", MYSELF, destination);
     MPI_Send(&response, sizeof(struct Response), MPI_BYTE, destination, ACK, MPI_COMM_WORLD);
     listenFor(RELEASE, &RELEASES[destination], destination);
 }
 
+void sendRELEASE() {
+    auto demand = Response(now(), MY_DEMAND.data);
+    ROOMS_WANTED -= demand.data;
+    MY_DEMAND = {}; // will it work?
+    for (int destination = 0; destination < SIZE; destination++) {
+        if (destination != MYSELF) {
+            printf("[#%d][%s][SEND] Sending RELEASE rooms=[%d] to #%d\n", MYSELF, "RELEASE", demand.data, destination);
+            MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, RELEASE, MPI_COMM_WORLD);
+//            listenFor(ACK, &ACKS[destination], destination); // will it work?
+        }
+    }
+}
+
 void sendREQ() {
-    Response demand = Response(now(), atLeastOne());
+    auto demand = Response(now(), atLeastOne());
     MY_DEMAND = demand;
     ROOMS_WANTED += demand.data;
     for (int destination = 0; destination < SIZE; destination++) {
@@ -302,7 +305,7 @@ void initRespones() {
 }
 
 int atLeastOne() {
-    return (rand() % 3) + 1;
+    return (rand() % MAX_ROOMS) + 1;
 }
 
 void sleepMillis(int millis) {
