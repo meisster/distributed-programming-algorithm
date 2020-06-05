@@ -12,7 +12,7 @@
 #define REQ 2
 #define RELEASE 3
 #define MAX_ROOMS 10
-#define TIMEOUT 6
+#define TIMEOUT 10
 
 struct Response {
     Response() = default;
@@ -34,10 +34,10 @@ struct ProcessData {
     long long timestamp;
 
     bool hasOlderTimestamp(Response *my_demand, int process_id, int my_id) const {
-        if (this->timestamp < my_demand->timestamp) {
+        if (this->timestamp < my_demand->timestamp && this->timestamp != 0) {
             return true;
         } else if (this->timestamp == my_demand->timestamp) {
-            printf("[#%d] Timestamps equal! Prioritizing lower ID [%d] > [%d]\n", my_id, process_id, my_id);
+            printf("[#%d][INFO] Timestamps equal! Prioritizing lower ID [%d] > [%d]\n", my_id, process_id, my_id);
             return process_id > my_id;
         } else {
             return false;
@@ -64,7 +64,6 @@ static int MYSELF;
 static int SIZE;
 static int MESSAGES_RECEIVED = 0;
 static int ROOMS_WANTED = 0;
-static int ROOMS_OCCUPIED = 0;
 static int ACKS_ACQUIRED = 0;
 static std::map<int, ProcessData> PROCESSES_MAP;
 static Response MY_DEMAND;
@@ -116,7 +115,7 @@ int main(int argc, char **argv) {
 
     // send initial data
     sendREQ();
-//
+
     // start handles for responses
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF) {
@@ -134,9 +133,8 @@ int main(int argc, char **argv) {
         checkREQ(&finished);
         checkACK(&finished);
         checkRELEASE(&finished);
-        if (MESSAGES_RECEIVED >= (SIZE - 1)) {
-            tryToOccupyRooms(&finished);
-        }
+
+        tryToOccupyRooms(&finished);
 
         auto end = chrono::steady_clock::now();
         timeout = chrono::duration_cast<chrono::seconds>(end - start).count() > TIMEOUT;
@@ -144,16 +142,16 @@ int main(int argc, char **argv) {
             sleepMillis(100);
         }
         if (timeout) {
-            printf("[#%d][INFO]Timeout!\n", MYSELF);
+            printf("[#%d][INFO] Timeout!\n", MYSELF);
         }
     }
 
-    for (auto const&[key, value] : PROCESSES_MAP) {
-        if (key != MYSELF) {
-            cout << "[#" << MYSELF << "][INFO] Process #" << key << " rooms=[" << value.rooms << "],ack=["
-                 << value.received_ack << "]" << endl;
-        }
-    }
+//    for (auto const&[key, value] : PROCESSES_MAP) {
+//        if (key != MYSELF) {
+//            cout << "[#" << MYSELF << "][INFO] Process #" << key << " rooms=[" << value.rooms << "],ack=["
+//                 << value.received_ack << "]" << endl;
+//        }
+//    }
     MPI_Finalize();
 }
 
@@ -163,7 +161,7 @@ void tryToOccupyRooms(bool *finished) {
         if (process_id != MYSELF) {
             auto condition = PROCESSES_MAP.find(process_id)->second.hasOlderTimestamp(&MY_DEMAND, process_id, MYSELF) ||
                              PROCESSES_MAP.find(process_id)->second.receivedACK();
-            printf("[#%d][OCCUPY] Process #%d hasOlderTimestamp=%d, receivedACK=%d\n", MYSELF, process_id, PROCESSES_MAP.find(process_id)->second.hasOlderTimestamp(&MY_DEMAND, process_id, MYSELF), PROCESSES_MAP.find(process_id)->second.receivedACK());
+//            printf("[#%d][OCCUPY] Process #%d hasOlderTimestamp=%d, receivedACK=%d\n", MYSELF, process_id, PROCESSES_MAP.find(process_id)->second.hasOlderTimestamp(&MY_DEMAND, process_id, MYSELF), PROCESSES_MAP.find(process_id)->second.receivedACK());
             iCanGoIn = condition;
             if (!condition) {
                 iCanGoIn = false;
@@ -171,14 +169,14 @@ void tryToOccupyRooms(bool *finished) {
             }
         }
     }
-    printf("[#%d][OCCUPY] ROOMS_WANTED=[%d], ACKS_ACQUIRED=[%d]\n", MYSELF, ROOMS_WANTED, ACKS_ACQUIRED);
+//    printf("[#%d][OCCUPY] ROOMS_WANTED=[%d], ACKS_ACQUIRED=[%d]\n", MYSELF, ROOMS_WANTED, ACKS_ACQUIRED);
     if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn) {
-        printf("[#%d][OCCUPY] I have taken the rooms=[%d]! Going to sleep for 2 seconds\n", MYSELF, MY_DEMAND.data);
+        printf("[#%d][OCCUPY][SUCCESS] I have taken the rooms=[%d]! Going to sleep for 2 seconds\n", MYSELF, MY_DEMAND.data);
         *finished = true;
         sleepMillis(2000);
         sendRELEASE();
     } else {
-        printf("[#%d][OCCUPY] Cannot occupy room, waiting...\n", MYSELF);
+//        printf("[#%d][OCCUPY][ERROR] Cannot occupy room, waiting...\n", MYSELF);
         sleepMillis(1000);
     }
 }
@@ -226,9 +224,8 @@ void checkRELEASE(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
         if (process_id != MYSELF) {
-            printf("[#%d][%s][CHECK] Checking for RELEASE from #%d current=%d\n", MYSELF, "RELEASE", process_id, RELEASES[process_id].response.data);
             MPI_Test(&RELEASES[process_id].request, &requestFinished, MPI_STATUS_IGNORE);
-            if (requestFinished) {
+            if (requestFinished && !RELEASES[process_id].requestCompleted) {
                 printf("[#%d][%s][RECEIVE] Received %d_%lld from #%d\n", MYSELF, "RELEASE", RELEASES[process_id].response.data,
                        RELEASES[process_id].response.timestamp,
                        process_id);
@@ -244,7 +241,6 @@ void sendACK(int destination) {
     auto response = Response(now(), true);
     printf("[#%d][ACK][SEND] Sending ACK to #%d\n", MYSELF, destination);
     MPI_Send(&response, sizeof(struct Response), MPI_BYTE, destination, ACK, MPI_COMM_WORLD);
-    listenFor(RELEASE, &RELEASES[destination], destination);
 }
 
 void sendRELEASE() {
@@ -255,7 +251,6 @@ void sendRELEASE() {
         if (destination != MYSELF) {
             printf("[#%d][%s][SEND] Sending RELEASE rooms=[%d] to #%d\n", MYSELF, "RELEASE", demand.data, destination);
             MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, RELEASE, MPI_COMM_WORLD);
-//            listenFor(ACK, &ACKS[destination], destination); // will it work?
         }
     }
 }
@@ -266,7 +261,7 @@ void sendREQ() {
     ROOMS_WANTED += demand.data;
     for (int destination = 0; destination < SIZE; destination++) {
         if (destination != MYSELF) {
-            printf("[#%d][%s][SEND] Sending %d_%lld to #%d\n", MYSELF, "REQ", demand.data, demand.timestamp, destination);
+            printf("[#%d][%s][SEND] Requesting rooms=[%d][%lld] to #%d\n", MYSELF, "REQ", demand.data, demand.timestamp, destination);
             MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, REQ, MPI_COMM_WORLD);
             ACKS[destination].requestCompleted = false;
             listenFor(ACK, &ACKS[destination], destination);
