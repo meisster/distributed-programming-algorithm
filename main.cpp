@@ -13,15 +13,6 @@
 #define RELEASE 3
 #define MAX_ROOMS 10
 
-struct ProcessData {
-    ProcessData() = default;
-
-    ProcessData(int rooms, bool receivedAck) : rooms(rooms), received_ack(receivedAck) {}
-
-    int rooms;
-    bool received_ack;
-};
-
 struct Response {
     Response() = default;
 
@@ -31,11 +22,39 @@ struct Response {
     int data;
 };
 
-struct ProcessRequest {
-    ProcessRequest() = default;
+struct ProcessData {
+    ProcessData() = default;
 
-    ProcessRequest(MPI_Request request, const Response &response) : request(request), response(response) {}
+    ProcessData(int rooms, bool receivedAck, long long int timestamp) :
+            rooms(rooms), received_ack(receivedAck), timestamp(timestamp) {}
 
+    int rooms;
+    bool received_ack;
+    long long timestamp;
+
+    bool hasOlderTimestamp(Response *my_demand, int process_id, int my_id) const {
+        if (this->timestamp < my_demand->timestamp) {
+            return true;
+        } else if (this->timestamp == my_demand->timestamp) {
+            printf("[#%d] Timestamps equal! Prioritizing lower ID [%d] > [%d]\n", my_id, process_id, my_id);
+            return process_id > my_id;
+        } else {
+            return false;
+        };
+    }
+
+    bool receivedACK() {
+        return this->received_ack;
+    }
+};
+
+struct ProcessRequestResponse {
+    ProcessRequestResponse() = default;
+
+    ProcessRequestResponse(bool requestCompleted, MPI_Request request, const Response &response) :
+            requestCompleted(requestCompleted), request(request), response(response) {}
+
+    bool requestCompleted;
     MPI_Request request;
     Response response;
 };
@@ -43,18 +62,21 @@ struct ProcessRequest {
 static int MYSELF;
 static int SIZE;
 static int MESSAGES_RECEIVED = 0;
+static int ROOMS_WANTED = 0;
+static int ROOMS_OCCUPIED = 0;
+static int ACKS_ACQUIRED = 0;
 static std::map<int, ProcessData> PROCESSES_MAP;
 static Response MY_DEMAND;
-std::vector<ProcessRequest> REQS;
-std::vector<ProcessRequest> ACKS;
-std::vector<ProcessRequest> RELEASES;
+std::vector<ProcessRequestResponse> REQS;
+std::vector<ProcessRequestResponse> ACKS;
+std::vector<ProcessRequestResponse> RELEASES;
 std::vector<ProcessData> RESPONSES;
 
 long long now();
 
 int atLeastOne();
 
-void init(std::vector<ProcessRequest> *table);
+void init(std::vector<ProcessRequestResponse> *table);
 
 void sleepMillis(int millis);
 
@@ -64,13 +86,19 @@ void checkACK(bool *notFinished);
 
 void checkRELEASE(bool *notFinished);
 
+void sendACK(int destination);
+
 void initRespones();
 
 void initProcessMap();
 
-void listenFor(int TAG, ProcessRequest *process);
+void listenFor(int TAG, ProcessRequestResponse *process, int process_id);
 
-void demandRooms();
+void sendREQ();
+
+void tryToOccupyRooms(bool *finished);
+
+void sendRELEASE();
 
 using namespace std;
 
@@ -86,67 +114,121 @@ int main(int argc, char **argv) {
     initRespones();
 
     // send initial data
-    demandRooms();
+    sendREQ();
 //
     // start handles for responses
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF) {
-            listenFor(REQ, &REQS[process_id]);
-            listenFor(ACK, &ACKS[process_id]);
-            listenFor(RELEASE, &RELEASES[process_id]);
+            listenFor(REQ, &REQS[process_id], process_id);
+            listenFor(RELEASE, &RELEASES[process_id], process_id);
         }
     }
 
     // main loop
-    auto notFinished = true;
-    while (notFinished) {
-        checkREQ(&notFinished);
-        checkACK(&notFinished);
-        checkRELEASE(&notFinished);
+    auto finished = false;
+    auto timeout = false;
+    auto start = chrono::steady_clock::now();
 
-        if (notFinished) {
+    while (!finished && !timeout) {
+        auto end = chrono::steady_clock::now();
+        timeout = chrono::duration_cast<chrono::seconds>(end - start).count() > 2;
+        if (timeout) {
+            printf("Timeout!\n");
+        }
+        checkREQ(&finished);
+        checkACK(&finished);
+        checkRELEASE(&finished);
+        if (MESSAGES_RECEIVED >= (SIZE - 1)) {
+            tryToOccupyRooms(&finished);
+        }
+        if (!finished) {
             sleepMillis(100);
         }
     }
 
-    printf("[#%d] I finished!\n", MYSELF);
     for (auto const&[key, value] : PROCESSES_MAP) {
-        cout << "[" << MYSELF << "] Process #" << key << " rooms=[" << value.rooms << "],ack=["
-             << value.received_ack << "]" << endl;
+        if (key != MYSELF) {
+            cout << "[#" << MYSELF << "] Process #" << key << " rooms=[" << value.rooms << "],ack=["
+                 << value.received_ack << "]" << endl;
+        }
     }
     MPI_Finalize();
+}
+
+void tryToOccupyRooms(bool *finished) {
+    bool iCanGoIn = false;
+    for (int process_id = 0; process_id < SIZE; process_id++) {
+        if (process_id != MYSELF) {
+            auto condition = PROCESSES_MAP.find(process_id)->second.hasOlderTimestamp(&MY_DEMAND, process_id, MYSELF) ||
+                             PROCESSES_MAP.find(process_id)->second.receivedACK();
+            printf("[#%d][OCCUPY] Process #%d hasOlderTimestamp=%d, receivedACK=%d\n", MYSELF, process_id, PROCESSES_MAP.find(process_id)->second.hasOlderTimestamp(&MY_DEMAND, process_id, MYSELF), PROCESSES_MAP.find(process_id)->second.receivedACK());
+            iCanGoIn = condition;
+            if (!condition) {
+                iCanGoIn = false;
+                break;
+            }
+        }
+    }
+    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn) {
+        printf("[#%d][OCCUPY] ROOMS_WANTED=[%d], ACKS_ACQUIRED=[%d]\n", MYSELF, ROOMS_WANTED, ACKS_ACQUIRED);
+        printf("[#%d][OCCUPY] I have taken the rooms=[%d]! Going to sleep for 5 seconds\n", MYSELF, MY_DEMAND.data);
+        *finished = true;
+        sleepMillis(5000);
+        sendRELEASE();
+    } else {
+        printf("[#%d][OCCUPY] Cannot occupy room, waiting...\n", MYSELF);
+        sleepMillis(1000);
+    }
+}
+
+void sendRELEASE() {
+    Response demand = Response(now(), MY_DEMAND.data);
+    ROOMS_WANTED -= demand.data;
+    MY_DEMAND = {}; // will it work?
+    for (int destination = 0; destination < SIZE; destination++) {
+        if (destination != MYSELF) {
+            printf("[#%d][%s][SEND] Sending RELEASE %d to #%d\n", MYSELF, "RELEASE", demand.data, destination);
+            MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, RELEASE, MPI_COMM_WORLD);
+//            listenFor(ACK, &ACKS[destination], destination); // will it work?
+        }
+    }
 }
 
 void checkREQ(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
-        MPI_Status status;
         if (process_id != MYSELF) {
-            MPI_Test(&REQS[process_id].request, &requestFinished, &status);
-            if (requestFinished) {
-                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "REQ", REQS[process_id].response.data,
-                       process_id);
-                auto process = PROCESSES_MAP.find(process_id);
-                process->second.rooms = REQS[process_id].response.data;
+            MPI_Test(&REQS[process_id].request, &requestFinished, MPI_STATUS_IGNORE);
+            if (requestFinished && !REQS[process_id].requestCompleted) {
                 MESSAGES_RECEIVED++;
+                printf("[#%d][%s][RECEIVE] Received %d_%lld from #%d\n", MYSELF, "REQ", REQS[process_id].response.data,
+                       REQS[process_id].response.timestamp,
+                       process_id);
+                REQS[process_id].requestCompleted = true;
+                PROCESSES_MAP.find(process_id)->second.rooms = REQS[process_id].response.data;
+                PROCESSES_MAP.find(process_id)->second.timestamp = REQS[process_id].response.timestamp;
+                ROOMS_WANTED += REQS[process_id].response.data;
+                if (REQS[process_id].response.timestamp < MY_DEMAND.timestamp) {
+                    printf("[#%d][REQ] Got request with higher priority, sending ACK to #%d\n", MYSELF, process_id);
+                    sendACK(process_id);
+                }
             }
         }
     }
-    *notFinished = MESSAGES_RECEIVED != SIZE - 1;
 }
 
 void checkACK(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
-        MPI_Status status;
         if (process_id != MYSELF) {
-            MPI_Test(&ACKS[process_id].request, &requestFinished, &status);
-            if (requestFinished) {
-                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "ACK", ACKS[process_id].response.data,
+            MPI_Test(&ACKS[process_id].request, &requestFinished, MPI_STATUS_IGNORE);
+            if (requestFinished && !ACKS[process_id].requestCompleted) {
+                printf("[#%d][%s][RECEIVE] Received %d_%lld from #%d\n", MYSELF, "ACK", ACKS[process_id].response.data,
+                       ACKS[process_id].response.timestamp,
                        process_id);
-                auto process = PROCESSES_MAP.find(process_id);
-                process->second.received_ack = ACKS[process_id].response.data;
-                MESSAGES_RECEIVED++;
+                ACKS[process_id].requestCompleted = true;
+                PROCESSES_MAP.find(process_id)->second.received_ack = ACKS[process_id].response.data;
+                ACKS_ACQUIRED += PROCESSES_MAP.find(process_id)->second.rooms;
             }
         }
     }
@@ -155,35 +237,44 @@ void checkACK(bool *notFinished) {
 void checkRELEASE(bool *notFinished) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         int requestFinished = 0;
-        MPI_Status status;
         if (process_id != MYSELF) {
-            MPI_Test(&RELEASES[process_id].request, &requestFinished, &status);
-            if (requestFinished) {
-                printf("[#%d][%s] Received %d from #%d\n", MYSELF, "RELEASE", RELEASES[process_id].response.data,
+            MPI_Test(&RELEASES[process_id].request, &requestFinished, MPI_STATUS_IGNORE);
+            if (requestFinished && !RELEASES[process_id].requestCompleted) {
+                printf("[#%d][%s][RECEIVE] Received %d_%lld from #%d\n", MYSELF, "RELEASE", RELEASES[process_id].response.data,
+                       RELEASES[process_id].response.timestamp,
                        process_id);
-                auto process = PROCESSES_MAP.find(process_id);
-                process->second.rooms -= RELEASES[process_id].response.data;
-                MESSAGES_RECEIVED++;
+                RELEASES[process_id].requestCompleted = true;
+                PROCESSES_MAP.find(process_id)->second.rooms -= RELEASES[process_id].response.data;
+                ROOMS_WANTED -= RELEASES[process_id].response.data;
             }
         }
     }
 }
 
-void demandRooms() {
+void sendACK(int destination) {
+    auto response = Response(now(), true);
+    MPI_Send(&response, sizeof(struct Response), MPI_BYTE, destination, ACK, MPI_COMM_WORLD);
+    listenFor(RELEASE, &RELEASES[destination], destination);
+}
+
+void sendREQ() {
     Response demand = Response(now(), atLeastOne());
     MY_DEMAND = demand;
+    ROOMS_WANTED += demand.data;
     for (int destination = 0; destination < SIZE; destination++) {
         if (destination != MYSELF) {
-            printf("[#%d][%s] Sending %d to #%d\n", MYSELF, "REQ", demand.data, destination);
+            printf("[#%d][%s][SEND] Sending %d_%lld to #%d\n", MYSELF, "REQ", demand.data, demand.timestamp, destination);
             MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, REQ, MPI_COMM_WORLD);
+            ACKS[destination].requestCompleted = false;
+            listenFor(ACK, &ACKS[destination], destination);
         }
     }
 }
 
-void listenFor(int TAG, ProcessRequest *process) {
+void listenFor(int TAG, ProcessRequestResponse *process, int process_id) {
     MPI_Irecv(&process->response,
               sizeof(struct Response),
-              MPI_BYTE, MPI_ANY_SOURCE, TAG, MPI_COMM_WORLD,
+              MPI_BYTE, process_id, TAG, MPI_COMM_WORLD,
               &process->request);
 }
 
@@ -194,11 +285,12 @@ void initProcessMap() {
     }
 }
 
-void init(std::vector<ProcessRequest> *table) {
+void init(vector<ProcessRequestResponse> *table) {
     table->resize(SIZE);
     for (int process_id = 0; process_id < SIZE; process_id++) {
         table->at(process_id).request = MPI_REQUEST_NULL;
         table->at(process_id).response = {};
+        table->at(process_id).requestCompleted = false;
     }
 }
 
@@ -210,15 +302,15 @@ void initRespones() {
 }
 
 int atLeastOne() {
-    return (rand() % MAX_ROOMS) + 1;
+    return (rand() % 3) + 1;
 }
 
 void sleepMillis(int millis) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+    this_thread::sleep_for(chrono::milliseconds(millis));
 }
 
 long long now() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();;
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
 }
 
