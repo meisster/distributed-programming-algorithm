@@ -8,13 +8,15 @@
 #include <chrono>
 #include <map>
 #include <thread>
+#include <mutex>
 
 #define ACK 1
 #define REQ 2
 #define RELEASE 3
 #define ERROR_CODE 404
 #define MAX_ROOMS 10
-#define TIMEOUT 5
+#define TIMEOUT 20
+#define ELEVATORS 2
 
 struct Response {
     Response() = default;
@@ -30,11 +32,10 @@ struct ProcessData {
     ProcessData() = default;
 
     ProcessData(int rooms, bool receivedAck, long long int timestamp) :
-            rooms(rooms), received_ack(receivedAck), timestamp(timestamp), sent_ACK(false) {}
+            rooms(rooms), received_ack_from(receivedAck), timestamp(timestamp) {}
 
-    bool sent_ACK;
     int rooms;
-    bool received_ack;
+    bool received_ack_from;
     long long timestamp;
 
     bool hasOlderTimestamp(Response *my_demand, int process_id, int my_id) const {
@@ -49,7 +50,7 @@ struct ProcessData {
     }
 
     bool receivedACK() {
-        return this->received_ack;
+        return this->received_ack_from;
     }
 };
 
@@ -65,7 +66,6 @@ static int MYSELF;
 static int SIZE;
 static int ACKS_OFFSET;
 static int RELEASE_OFFSET;
-static int MESSAGES_RECEIVED = 0;
 static int ROOMS_WANTED = 0;
 static int ACKS_ACQUIRED = 0;
 static std::map<int, ProcessData> PROCESSES_MAP;
@@ -74,7 +74,6 @@ static int ERROR;
 std::vector<ProcessResponse> REQS;
 std::vector<ProcessResponse> ACKS;
 std::vector<ProcessResponse> RELEASES;
-std::vector<ProcessData> RESPONSES;
 
 long long now();
 
@@ -110,7 +109,9 @@ void sendRELEASE();
 
 void initRequests(MPI_Request *requests);
 
-void sendACKToRest();
+void sendACKToEveryone();
+
+int countACKS();
 
 using namespace std;
 
@@ -148,10 +149,10 @@ int main(int argc, char **argv) {
     auto finished = false;
     int indexes[(SIZE * 3) + 1];
     int count = 0;
-    while (!finished) {
+    while (true) {
         MPI_Waitsome((SIZE * 3) + 1, requests, &count, indexes, MPI_STATUSES_IGNORE);
         finished = checkForErrors(&requests[ERROR], count);
-//        printf("[#%d] Got %d requests!\n", MYSELF, count);
+        if (finished) break;
         checkACK(indexes, requests);
         checkRELEASE(indexes, requests);
         checkREQ(indexes, requests);
@@ -161,7 +162,7 @@ int main(int argc, char **argv) {
 //    for (auto const&[key, value] : PROCESSES_MAP) {
 //        if (key != MYSELF) {
 //            cout << "[#" << MYSELF << "][INFO] Process #" << key << " rooms=[" << value.rooms << "],ack=["
-//                 << value.received_ack << "]" << endl;
+//                 << value.received_ack_from << "]" << endl;
 //        }
 //    }
     MPI_Finalize();
@@ -190,42 +191,49 @@ void tryToOccupyRooms(int *indexes) {
             }
         }
     }
-    printf("[#%d][%s] %s=[%d], %s=[%d]\n", MYSELF, YELL("OCC"),
-           LYELLOW("ROOMS_WANTED"), ROOMS_WANTED, LYELLOW("ACKS_ACQUIRED"), ACKS_ACQUIRED);
-    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn) {
-        auto timestamp = now();
-        printf("[#%d][%s][%s] %s=[%d]!\n", MYSELF, YELL("OCC"), LGREEN("SCC"),
-               LGREEN("I have taken the rooms"), MY_DEMAND.data);
-        sleepMillis(2000);
+//    printf("[%s][#%d] %s=[%d], %s=[%d]\n", YELL("OCC"), MYSELF,
+//           LYELLOW("ROOMS_WANTED"), ROOMS_WANTED, LYELLOW("ACKS_ACQUIRED"), ACKS_ACQUIRED);
+    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn && countACKS() >= SIZE - ELEVATORS) {
+        printf("[%s][%s][#%d] %s=[%d] with %d ACKS!\n", YELL("OCC"), LGREEN("SCC"), MYSELF,
+               LGREEN("I have taken the rooms"), MY_DEMAND.data, countACKS());
+        sleepMillis(5000); // enjoy your time in isolation!
         sendRELEASE();
-        sendACKToRest();
-        sleepMillis(200);
+        sleepMillis(500); // think about sending new request
         sendREQ();
+        sendACKToEveryone(); // put myself at the end the line
     }
 }
 
-void sendACKToRest() {
+int countACKS() {
+    auto count = 0;
     for (auto const&[process_id, process] : PROCESSES_MAP) {
-        if (process_id != MYSELF && !process.sent_ACK) {
+        if (process_id != MYSELF && process.received_ack_from) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void sendACKToEveryone() {
+    for (auto const&[process_id, process] : PROCESSES_MAP) {
+        if (process_id != MYSELF) {
             sendACK(process_id);
         }
-        // cleanup
-        PROCESSES_MAP.at(process_id).sent_ACK = false;
     }
 }
 
 void checkREQ(int *indexes, MPI_Request *requests) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF && REQS[process_id].response.dirty) {
-            printf("[#%d][%s][%s] Got REQ rooms=[%d] from %d!\n", MYSELF, LRED("REQ"), LGREEN("RCV"),
-                   REQS[process_id].response.data, process_id);
+            printf("[%s][%s][#%d] %s[%d] from #%d!\n", LRED("REQ"), LGREEN("RCV"), MYSELF,
+                   LRED("Got REQ rooms="), REQS[process_id].response.data, process_id);
             listenFor(REQ, &REQS[process_id], process_id, &requests[process_id]);
             REQS[process_id].response.dirty = false;
             PROCESSES_MAP.at(process_id).rooms = REQS[process_id].response.data;
             PROCESSES_MAP.at(process_id).timestamp = REQS[process_id].response.timestamp;
             ROOMS_WANTED += REQS[process_id].response.data;
             if (REQS[process_id].response.timestamp < MY_DEMAND.timestamp) {
-                sendACK(process_id);
+                sendACK(process_id); //fixme
             }
         }
     }
@@ -237,9 +245,10 @@ void checkACK(int *indexes, MPI_Request *requests) {
             listenFor(ACK, &ACKS[process_id], process_id, &requests[ACKS_OFFSET + process_id]);
             ACKS[process_id].response.dirty = false;
             if (ACKS[process_id].response.timestamp == MY_DEMAND.timestamp) {
-                printf("[#%d][%s][%s] Got ACK from %d!\n", MYSELF, LBLUE("ACK"), LGREEN("RCV"), process_id);
-                PROCESSES_MAP.at(process_id).received_ack = ACKS[process_id].response.data;
-                ACKS_ACQUIRED += PROCESSES_MAP.find(process_id)->second.rooms;
+                printf("[%s][%s][#%d] %s%d!\n", LBLUE("ACK"), LGREEN("RCV"), MYSELF,
+                        LBLUE("Got ACK from #"), process_id);
+                PROCESSES_MAP.at(process_id).received_ack_from = ACKS[process_id].response.data;
+                ACKS_ACQUIRED += REQS[process_id].response.data;
             }
         }
     }
@@ -248,8 +257,8 @@ void checkACK(int *indexes, MPI_Request *requests) {
 void checkRELEASE(int *indexes, MPI_Request *requests) {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF && RELEASES[process_id].response.dirty) {
-            printf("[#%d][%s][%s] RELEASE rooms=[%d] from #%d!\n", MYSELF, LMAG("RLS"), LGREEN("RCV"),
-                    RELEASES[process_id].response.data, process_id);
+            printf("[%s][%s][#%d] %s=[%d] from #%d!\n", LMAG("RLS"), LGREEN("RCV"), MYSELF,
+                    LMAG("Got RELEASE rooms"), RELEASES[process_id].response.data, process_id);
             listenFor(RELEASE, &RELEASES[process_id], process_id, &requests[RELEASE_OFFSET + process_id]);
             RELEASES[process_id].response.dirty = false;
             PROCESSES_MAP.at(process_id).rooms -= RELEASES[process_id].response.data;
@@ -259,9 +268,9 @@ void checkRELEASE(int *indexes, MPI_Request *requests) {
 }
 
 void sendACK(int destination) {
-    PROCESSES_MAP.at(destination).sent_ACK = true;
     auto response = Response(REQS[destination].response.timestamp, true, true);
-    printf("[#%d][%s][%s] Sending ACK to #%d\n", MYSELF, LBLUE("ACK"), LYELLOW("SND"), destination);
+    printf("[%s][%s][#%d] %s%d\n", LBLUE("ACK"), LYELLOW("SND"), MYSELF,
+            BLUE("Sending ACK to #"), destination);
     MPI_Send(&response, sizeof(struct Response), MPI_BYTE, destination, ACK, MPI_COMM_WORLD);
 }
 
@@ -269,10 +278,10 @@ void sendRELEASE() {
     auto demand = Response(now(), MY_DEMAND.data, true);
     ROOMS_WANTED -= demand.data;
     MY_DEMAND = {};
+    printf("[%s][%s][#%d] %s[%d]\n", LMAG("RLS"), LYELLOW("SND"), MYSELF,
+           MAG("Sending RELEASE rooms="), demand.data);
     for (int destination = 0; destination < SIZE; destination++) {
         if (destination != MYSELF) {
-            printf("[#%d][%s][%s] Sending RELEASE rooms=[%d] to #%d\n", MYSELF, LMAG("RLS"), LYELLOW("SND"),
-                   demand.data, destination);
             MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, RELEASE, MPI_COMM_WORLD);
         }
     }
@@ -282,15 +291,12 @@ void sendREQ() {
     auto demand = Response(now(), atLeastOne(), true);
     MY_DEMAND = demand;
     ROOMS_WANTED += demand.data;
+    printf("[%s][%s][#%d] %s[%d][%lld]\n", LRED("REQ"), LYELLOW("SND"), MYSELF,
+           RED("REQUESTING ROOMS="), demand.data, demand.timestamp);
     for (int destination = 0; destination < SIZE; destination++) {
         if (destination != MYSELF) {
-            printf("[#%d][%s][%s] Requesting rooms=[%d][%lld] to #%d\n", MYSELF, LRED("REQ"), LYELLOW("SND"),
-                   demand.data, demand.timestamp,
-                   destination);
             MPI_Send(&demand, sizeof(struct Response), MPI_BYTE, destination, REQ, MPI_COMM_WORLD);
-//            PROCESSES_MAP.at(destination).timestamp = 0;
-            PROCESSES_MAP.at(destination).received_ack = false;
-//            PROCESSES_MAP.at(destination).rooms = 0;
+            PROCESSES_MAP.at(destination).received_ack_from = false;
         }
     }
     ACKS_ACQUIRED = 0;
@@ -324,7 +330,7 @@ void init(vector<ProcessResponse> *table) {
 }
 
 int atLeastOne() {
-    return (rand() % MAX_ROOMS) + 1;
+    return (rand() % MAX_ROOMS/2) + 1;
 }
 
 void sleepMillis(int millis) {
@@ -337,13 +343,12 @@ long long now() {
 }
 
 void timeout() {
-    auto timeout = false;
+    timed_mutex mtx;
     auto response = Response(now(), 1, true);
-    auto start = chrono::steady_clock::now();
-    while (!timeout) {
-        auto end = chrono::steady_clock::now();
-        timeout = chrono::duration_cast<chrono::seconds>(end - start).count() > TIMEOUT;
-        sleepMillis(500);
+    mtx.lock();
+    if (!mtx.try_lock_for(chrono::seconds(TIMEOUT))) {
+        mtx.unlock();
+        MPI_Send(&response, sizeof(struct Response), MPI_BYTE, MYSELF, ERROR_CODE, MPI_COMM_WORLD);
     }
-    MPI_Send(&response, sizeof(struct Response), MPI_BYTE, MYSELF, ERROR_CODE, MPI_COMM_WORLD);
+
 }
