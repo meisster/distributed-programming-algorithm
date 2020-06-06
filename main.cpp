@@ -176,8 +176,8 @@ void tryToOccupyRooms() {
     bool iCanGoIn = false;
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF) {
-            iCanGoIn = PROCESSES_MAP.find(process_id)->second.hasOlderTimestamp(&MY_REQUEST, process_id, MYSELF) ||
-                       PROCESSES_MAP.find(process_id)->second.receivedACK();
+            iCanGoIn = PROCESSES_MAP.at(process_id).hasOlderTimestamp(&MY_REQUEST, process_id, MYSELF) ||
+                       PROCESSES_MAP.at(process_id).receivedACK();
             if (!iCanGoIn) break;
         }
     }
