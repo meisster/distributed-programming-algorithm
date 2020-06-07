@@ -16,7 +16,7 @@
 #define ERROR_CODE 404
 
 #define MAX_ROOMS 10
-#define TIMEOUT 20
+#define TIMEOUT 2
 #define ELEVATORS 2
 
 struct Response {
@@ -76,6 +76,7 @@ ProcessResponse TIMEOUT_RESPONSE = {};
 std::vector<ProcessResponse> REQS;
 std::vector<ProcessResponse> ACKS;
 std::vector<ProcessResponse> RELEASES;
+std::vector<MPI_Request> REQUESTS;
 
 long long now();
 
@@ -109,7 +110,7 @@ void tryToOccupyRooms();
 
 void sendRELEASE();
 
-void initRequests(MPI_Request *requests);
+void initRequests();
 
 void sendACKToEveryone();
 
@@ -122,26 +123,25 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &MYSELF);
     MPI_Comm_size(MPI_COMM_WORLD, &SIZE);
-    MPI_Request requests[(SIZE * 3) + 1]; // REQ + ACK + RELEASE + one ERROR
     ACKS_OFFSET = SIZE;
     RELEASE_OFFSET = 2 * SIZE;
     ERROR = SIZE * 3; // index of error message
 
-    initRequests(requests);
+    initRequests();
     init(&REQS);
     init(&ACKS);
     init(&RELEASES);
     initProcessMap();
-    listenFor(ERROR_CODE, &TIMEOUT_RESPONSE, MPI_ANY_SOURCE, &requests[ERROR]);
+    listenFor(ERROR_CODE, &TIMEOUT_RESPONSE, MPI_ANY_SOURCE, &REQUESTS[ERROR]);
     thread(timeout).detach(); // will send error message and terminate if running
     // send initial requests to all processes
     sendREQ();
     // start handles for responses
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF) {
-            listenFor(REQ, &REQS[process_id], process_id, &requests[process_id]);
-            listenFor(ACK, &ACKS[process_id], process_id, &requests[ACKS_OFFSET + process_id]);
-            listenFor(RELEASE, &RELEASES[process_id], process_id, &requests[RELEASE_OFFSET + process_id]);
+            listenFor(REQ, &REQS[process_id], process_id, &REQUESTS[process_id]);
+            listenFor(ACK, &ACKS[process_id], process_id, &REQUESTS[ACKS_OFFSET + process_id]);
+            listenFor(RELEASE, &RELEASES[process_id], process_id, &REQUESTS[RELEASE_OFFSET + process_id]);
 
         }
     }
@@ -151,12 +151,12 @@ int main(int argc, char **argv) {
     int indexes[(SIZE * 3) + 1];
     int requests_finished_count = 0;
     while (true) {
-        MPI_Waitsome((SIZE * 3) + 1, requests, &requests_finished_count, indexes, MPI_STATUSES_IGNORE);
-        shouldFinish = checkForErrors(&requests[ERROR], requests_finished_count); // count will set to MPI_UNDEFINED if there are not active requests left
+        MPI_Waitsome((SIZE * 3) + 1, REQUESTS.data(), &requests_finished_count, indexes, MPI_STATUSES_IGNORE);
+        shouldFinish = checkForErrors(&REQUESTS[ERROR], requests_finished_count); // count will set to MPI_UNDEFINED if there are not active requests left
         if (shouldFinish) break;
-        checkACK(requests);
-        checkRELEASE(requests);
-        checkREQ(requests);
+        checkACK(REQUESTS.data());
+        checkRELEASE(REQUESTS.data());
+        checkREQ(REQUESTS.data());
         tryToOccupyRooms();
     }
 
@@ -307,9 +307,10 @@ void initProcessMap() {
     }
 }
 
-void initRequests(MPI_Request *requests) {
+void initRequests() {
+    REQUESTS.resize(SIZE * 3 + 1);
     for (int i = 0; i < (SIZE * 3) + 1; i++) {
-        requests[i] = MPI_REQUEST_NULL;
+        REQUESTS[i] = MPI_REQUEST_NULL;
     }
 }
 
