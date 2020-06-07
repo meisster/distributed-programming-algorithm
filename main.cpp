@@ -19,7 +19,7 @@
 #define ERROR_CODE 500
 
 #define MAX_ROOMS 10
-#define TIMEOUT 8
+#define TIMEOUT 16
 #define ELEVATORS 2
 
 struct Message {
@@ -50,7 +50,7 @@ struct ProcessData {
             return process_id > my_id;
         } else {
             return false;
-        };
+        }
     }
 
     bool received_ACK() const {
@@ -60,8 +60,8 @@ struct ProcessData {
 
 static int MYSELF;
 static int SIZE;
-static bool CAN_OCCUPY_ROOMS;
-static bool CAN_OCCUPY_ELEVATOR;
+static bool CAN_OCCUPY_ROOMS = false;
+static bool CAN_OCCUPY_ELEVATOR = false;
 static int ACKS_OFFSET;
 static int RELEASE_OFFSET;
 static int E_REQ_OFFSET;
@@ -75,8 +75,8 @@ static int ELEVATORS_WANTED = 0;
 static int ELEVATORS_ACK_ACQUIRED = 0;
 static int ERROR;
 
-static Message MY_REQUEST;
-static Message E_MY_REQUEST;
+static Message MY_REQUEST = {};
+static Message E_MY_REQUEST = {};
 static Message ERROR_RESPONSE = {};
 static std::map<int, ProcessData> PROCESSES_MAP;
 static std::map<int, ProcessData> E_PROCESSES_MAP;
@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
         leave_elevator();
         use_room(); // chill in the solitary room
         wait_for_elevator_access(); // we need the elevator again
-        use_elevator(); // going down the elevator
+        use_elevator(); // going up the elevator
         leave_elevator();
         leave_room();
     }
@@ -215,7 +215,7 @@ void wait_for_room_access() {
 void wait_for_elevator_access() {
     int indexes[(SIZE * 6) + 1];
     send_E_REQ();
-    send_E_ACK_to_everyone();
+//    send_E_ACK_to_everyone();
     while (!error_occurred()) {
         MPI_Waitsome((SIZE * 6) + 1, REQUESTS.data(), &REQUESTS_FINISHED_COUNT, indexes, MPI_STATUSES_IGNORE);
         check_E_REQ();
@@ -242,15 +242,6 @@ bool can_occupy_rooms() {
         CAN_OCCUPY_ROOMS = false;
         return false;
     }
-//    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn && count_ACKS() >= SIZE - ELEVATORS) {
-//        printf("[%s][%s][#%d] %s=[%d] with %d ACKS!\n", YELL("OCC"), LGREEN("SCC"), MYSELF,
-//               LGREEN("I have taken the rooms"), MY_REQUEST.data, count_ACKS());
-//        sleep_millis(5000); // enjoy your time in isolation!
-//        send_RELEASE();
-//        sleep_millis(500); // think about sending new request
-//        send_REQ();
-//        send_ACK_to_everyone(); // put myself at the end the line
-//    }
 }
 
 bool can_occupy_elevator() {
@@ -262,6 +253,7 @@ bool can_occupy_elevator() {
             if (!iCanGoIn) break;
         }
     }
+    printf("[INFO][#%d] ELEVATORS_WANTED=%d ELEVATORS_ACK_ACQUIRED=%d iCanGoIn=%d\n", MYSELF, ELEVATORS_WANTED, ELEVATORS_ACK_ACQUIRED, iCanGoIn);
     if (ELEVATORS_WANTED - ELEVATORS_ACK_ACQUIRED <= ELEVATORS && iCanGoIn) {
         printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Permission to enter elevator granted!"));
         return true;
@@ -288,6 +280,7 @@ void use_elevator() {
 void leave_elevator() {
     printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Leaving the elevator!"));
     send_E_RELEASE();
+
 }
 
 void check_E_RELEASE() {
@@ -298,6 +291,7 @@ void check_E_RELEASE() {
             listen_for(E_RELEASE, &E_RELEASES[process_id], process_id, &REQUESTS[E_RELEASE_OFFSET + process_id]);
             E_RELEASES[process_id].dirty = false;
             E_PROCESSES_MAP.at(process_id).rooms -= E_RELEASES[process_id].data;
+//            E_PROCESSES_MAP.at(process_id).timestamp = 0;
             ELEVATORS_WANTED--;
         }
     }
@@ -306,8 +300,9 @@ void check_E_RELEASE() {
 void check_E_ACK() {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF && E_ACKS[process_id].dirty) {
-            listen_for(ACK, &E_ACKS[process_id], process_id, &REQUESTS[E_ACKS_OFFSET + process_id]);
+            listen_for(E_ACK, &E_ACKS[process_id], process_id, &REQUESTS[E_ACKS_OFFSET + process_id]);
             E_ACKS[process_id].dirty = false;
+//            printf("[[#%d] Got ack from %d, condition=%d\n", MYSELF, process_id, E_ACKS[process_id].timestamp == E_MY_REQUEST.timestamp);
             if (E_ACKS[process_id].timestamp == E_MY_REQUEST.timestamp) {
                 printf("[%s][%s][#%d] %s%d!\n", LBLUE("ECK"), LGREEN("RCV"), MYSELF,
                        LBLUE("Got E_ACK from #"), process_id);
@@ -369,16 +364,6 @@ void send_E_RELEASE() {
             MPI_Send(&demand, sizeof(struct Message), MPI_BYTE, destination, E_RELEASE, MPI_COMM_WORLD);
         }
     }
-}
-
-int count_ACKS() {
-    auto count = 0;
-    for (auto const&[process_id, process] : PROCESSES_MAP) {
-        if (process_id != MYSELF && process.received_ack_from) {
-            count++;
-        }
-    }
-    return count;
 }
 
 void send_ACK_to_everyone() {
@@ -516,8 +501,7 @@ void init(vector<Message> *messages) {
 }
 
 int at_least_one() {
-//    return (rand() % MAX_ROOMS) + 1;
-    return 1;
+    return (rand() % MAX_ROOMS) + 1;
 }
 
 void sleep_millis(int millis) {
@@ -539,6 +523,7 @@ void timeout() {
     mtx.lock();
     if (!mtx.try_lock_for(chrono::seconds(TIMEOUT))) { // eliminates active wait
         mtx.unlock();
+        printf("[#%d] timeoucik\n", MYSELF);
         MPI_Send(&response, sizeof(struct Message), MPI_BYTE, MYSELF, ERROR_CODE, MPI_COMM_WORLD);
     }
 }
