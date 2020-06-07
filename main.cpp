@@ -19,7 +19,7 @@
 #define ERROR_CODE 500
 
 #define MAX_ROOMS 10
-#define TIMEOUT 16
+#define TIMEOUT 60
 #define ELEVATORS 2
 
 struct Message {
