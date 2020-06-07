@@ -13,10 +13,13 @@
 #define ACK 1
 #define REQ 2
 #define RELEASE 3
-#define ERROR_CODE 404
+#define E_ACK 4
+#define E_REQ 5
+#define E_RELEASE 6
+#define ERROR_CODE 500
 
 #define MAX_ROOMS 10
-#define TIMEOUT 2
+#define TIMEOUT 8
 #define ELEVATORS 2
 
 struct Message {
@@ -57,17 +60,33 @@ struct ProcessData {
 
 static int MYSELF;
 static int SIZE;
+static bool CAN_OCCUPY_ROOMS;
+static bool CAN_OCCUPY_ELEVATOR;
 static int ACKS_OFFSET;
 static int RELEASE_OFFSET;
+static int E_REQ_OFFSET;
+static int E_ACKS_OFFSET;
+static int E_RELEASE_OFFSET;
+
+static int REQUESTS_FINISHED_COUNT = 0;
 static int ROOMS_WANTED = 0;
 static int ACKS_ACQUIRED = 0;
-static std::map<int, ProcessData> PROCESSES_MAP;
-static Message MY_REQUEST;
+static int ELEVATORS_WANTED = 0;
+static int ELEVATORS_ACK_ACQUIRED = 0;
 static int ERROR;
-Message ERROR_RESPONSE = {};
+
+static Message MY_REQUEST;
+static Message E_MY_REQUEST;
+static Message ERROR_RESPONSE = {};
+static std::map<int, ProcessData> PROCESSES_MAP;
+static std::map<int, ProcessData> E_PROCESSES_MAP;
 std::vector<Message> REQS;
 std::vector<Message> ACKS;
 std::vector<Message> RELEASES;
+std::vector<Message> E_REQS;
+std::vector<Message> E_ACKS;
+std::vector<Message> E_RELEASES;
+
 std::vector<MPI_Request> REQUESTS;
 
 long long now();
@@ -84,7 +103,7 @@ void check_ACK();
 
 void check_RELEASE();
 
-bool check_for_errors(const MPI_Request *error, int errorCode);
+bool error_occurred();
 
 void send_ACK(int destination);
 
@@ -96,7 +115,7 @@ void send_REQ();
 
 void timeout();
 
-void try_to_occupy_rooms();
+bool can_occupy_rooms();
 
 void send_RELEASE();
 
@@ -110,6 +129,36 @@ void initialize();
 
 void prepare_timeout_thread();
 
+void check_E_REQ();
+
+void send_E_ACK(int process_id);
+
+void send_E_REQ();
+
+void check_E_ACK();
+
+void check_E_RELEASE();
+
+bool can_occupy_elevator();
+
+void send_E_RELEASE();
+
+void wait_for_elevator_access();
+
+void use_elevator();
+
+void use_room();
+
+void leave_room();
+
+void wait_for_room_access();
+
+void send_E_ACK_to_everyone();
+
+void leave_elevator();
+
+void init_e_processes_map();
+
 using namespace std;
 
 int main(int argc, char **argv) {
@@ -118,61 +167,207 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &SIZE);
     initialize();
     prepare_timeout_thread();
+
     // send initial requests to all processes
     send_REQ();
+
     // start handles for responses
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF) {
             listen_for(REQ, &REQS[process_id], process_id, &REQUESTS[process_id]);
             listen_for(ACK, &ACKS[process_id], process_id, &REQUESTS[ACKS_OFFSET + process_id]);
             listen_for(RELEASE, &RELEASES[process_id], process_id, &REQUESTS[RELEASE_OFFSET + process_id]);
+            listen_for(E_REQ, &E_REQS[process_id], process_id, &REQUESTS[E_REQ_OFFSET + process_id]);
+            listen_for(E_ACK, &E_ACKS[process_id], process_id, &REQUESTS[E_ACKS_OFFSET + process_id]);
+            listen_for(E_RELEASE, &E_RELEASES[process_id], process_id, &REQUESTS[E_RELEASE_OFFSET + process_id]);
         }
     }
 
     // main loop
-    bool should_finish;
-    int indexes[(SIZE * 3) + 1];
-    int requests_finished_count = 0;
-    while (true) {
-        MPI_Waitsome((SIZE * 6) + 1, REQUESTS.data(), &requests_finished_count, indexes, MPI_STATUSES_IGNORE);
-        should_finish = check_for_errors(&REQUESTS[ERROR], requests_finished_count); // count will set to MPI_UNDEFINED if there are not active requests left
-        if (should_finish) break;
-        check_ACK();
-        check_RELEASE();
-        check_REQ();
-        try_to_occupy_rooms();
+    while (!error_occurred()) {
+        wait_for_room_access();
+        wait_for_elevator_access();
+        use_elevator(); // going down the elevator
+        leave_elevator();
+        use_room(); // chill in the solitary room
+        wait_for_elevator_access(); // we need the elevator again
+        use_elevator(); // going down the elevator
+        leave_elevator();
+        leave_room();
     }
 
+    printf("[#%d] %s\n", MYSELF, LRED("Error has occurred (probably timeout), shutting down!"));
     MPI_Finalize();
 }
 
-bool check_for_errors(const MPI_Request *error, int errorCode) {
-    if (*error == MPI_REQUEST_NULL || errorCode == MPI_UNDEFINED) {
-        printf("[#%d] %s\n", MYSELF, LRED("Error has occured (probably timeout), shutting down!"));
-        return true;
-    } else {
-        return false;
-    };
+void wait_for_room_access() {
+    int indexes[(SIZE * 6) + 1];
+    while (!error_occurred()) {
+        MPI_Waitsome((SIZE * 6) + 1, REQUESTS.data(), &REQUESTS_FINISHED_COUNT, indexes, MPI_STATUSES_IGNORE);
+        check_ACK();
+        check_RELEASE();
+        check_REQ();
+        if (can_occupy_rooms()) break;
+        check_E_REQ();
+    }
 }
 
-void try_to_occupy_rooms() {
+void wait_for_elevator_access() {
+    int indexes[(SIZE * 6) + 1];
+    send_E_REQ();
+    send_E_ACK_to_everyone();
+    while (!error_occurred()) {
+        MPI_Waitsome((SIZE * 6) + 1, REQUESTS.data(), &REQUESTS_FINISHED_COUNT, indexes, MPI_STATUSES_IGNORE);
+        check_E_REQ();
+        check_E_ACK();
+        check_E_RELEASE();
+        if (can_occupy_elevator()) break;
+    }
+}
+
+bool can_occupy_rooms() {
     bool iCanGoIn = false;
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF) {
             iCanGoIn = PROCESSES_MAP.at(process_id).has_older_timestamp(&MY_REQUEST, process_id, MYSELF) ||
-                    PROCESSES_MAP.at(process_id).received_ACK();
+                       PROCESSES_MAP.at(process_id).received_ACK();
             if (!iCanGoIn) break;
         }
     }
+    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn) {
+        printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Permission to enter room granted!"));
+        CAN_OCCUPY_ROOMS = true;
+        return true;
+    } else {
+        CAN_OCCUPY_ROOMS = false;
+        return false;
+    }
+//    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn && count_ACKS() >= SIZE - ELEVATORS) {
+//        printf("[%s][%s][#%d] %s=[%d] with %d ACKS!\n", YELL("OCC"), LGREEN("SCC"), MYSELF,
+//               LGREEN("I have taken the rooms"), MY_REQUEST.data, count_ACKS());
+//        sleep_millis(5000); // enjoy your time in isolation!
+//        send_RELEASE();
+//        sleep_millis(500); // think about sending new request
+//        send_REQ();
+//        send_ACK_to_everyone(); // put myself at the end the line
+//    }
+}
 
-    if (ROOMS_WANTED - ACKS_ACQUIRED <= MAX_ROOMS && iCanGoIn && count_ACKS() >= SIZE - ELEVATORS) {
-        printf("[%s][%s][#%d] %s=[%d] with %d ACKS!\n", YELL("OCC"), LGREEN("SCC"), MYSELF,
-               LGREEN("I have taken the rooms"), MY_REQUEST.data, count_ACKS());
-        sleep_millis(5000); // enjoy your time in isolation!
-        send_RELEASE();
-        sleep_millis(500); // think about sending new request
-        send_REQ();
-        send_ACK_to_everyone(); // put myself at the end the line
+bool can_occupy_elevator() {
+    bool iCanGoIn = false;
+    for (int process_id = 0; process_id < SIZE; process_id++) {
+        if (process_id != MYSELF) {
+            iCanGoIn = E_PROCESSES_MAP.at(process_id).has_older_timestamp(&E_MY_REQUEST, process_id, MYSELF) ||
+                       E_PROCESSES_MAP.at(process_id).received_ACK();
+            if (!iCanGoIn) break;
+        }
+    }
+    if (ELEVATORS_WANTED - ELEVATORS_ACK_ACQUIRED <= ELEVATORS && iCanGoIn) {
+        printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Permission to enter elevator granted!"));
+        return true;
+    } else return false;
+}
+
+void leave_room() {
+    printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Out of the room!"));
+    send_RELEASE();
+    send_REQ();
+    send_ACK_to_everyone(); // put myself at the end the line
+}
+
+void use_room() {
+    printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Using the room, be right back in 2 seconds!"));
+    sleep_millis(2000);
+}
+
+void use_elevator() {
+    printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Using the elevator!"));
+    sleep_millis(2000);
+}
+
+void leave_elevator() {
+    printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Leaving the elevator!"));
+    send_E_RELEASE();
+}
+
+void check_E_RELEASE() {
+    for (int process_id = 0; process_id < SIZE; process_id++) {
+        if (process_id != MYSELF && E_RELEASES[process_id].dirty) {
+            printf("[%s][%s][#%d] %s= from #%d!\n", LMAG("ERL"), LGREEN("RCV"), MYSELF,
+                   LMAG("Got E_RELEASE"), process_id);
+            listen_for(E_RELEASE, &E_RELEASES[process_id], process_id, &REQUESTS[E_RELEASE_OFFSET + process_id]);
+            E_RELEASES[process_id].dirty = false;
+            E_PROCESSES_MAP.at(process_id).rooms -= E_RELEASES[process_id].data;
+            ELEVATORS_WANTED--;
+        }
+    }
+}
+
+void check_E_ACK() {
+    for (int process_id = 0; process_id < SIZE; process_id++) {
+        if (process_id != MYSELF && E_ACKS[process_id].dirty) {
+            listen_for(ACK, &E_ACKS[process_id], process_id, &REQUESTS[E_ACKS_OFFSET + process_id]);
+            E_ACKS[process_id].dirty = false;
+            if (E_ACKS[process_id].timestamp == E_MY_REQUEST.timestamp) {
+                printf("[%s][%s][#%d] %s%d!\n", LBLUE("ECK"), LGREEN("RCV"), MYSELF,
+                       LBLUE("Got E_ACK from #"), process_id);
+                E_PROCESSES_MAP.at(process_id).received_ack_from = E_ACKS[process_id].data;
+                ELEVATORS_ACK_ACQUIRED++;
+            }
+        }
+    }
+}
+
+void check_E_REQ() {
+    for (int process_id = 0; process_id < SIZE; process_id++) {
+        if (process_id != MYSELF && E_REQS[process_id].dirty) {
+            printf("[%s][%s][#%d] %s[%d] from #%d!\n", LRED("ERQ"), LGREEN("RCV"), MYSELF,
+                   LRED("Got E_REQ="), E_REQS[process_id].data, process_id);
+
+            listen_for(E_REQ, &E_REQS[process_id], process_id, &REQUESTS[E_REQ_OFFSET + process_id]); // reactivate request handle
+            E_REQS[process_id].dirty = false; // mark response as processed
+            E_PROCESSES_MAP.at(process_id).rooms = E_REQS[process_id].data;
+            E_PROCESSES_MAP.at(process_id).timestamp = E_REQS[process_id].timestamp;
+            ELEVATORS_WANTED++;
+            if (E_REQS[process_id].timestamp < E_MY_REQUEST.timestamp || !CAN_OCCUPY_ROOMS) {
+                send_E_ACK(process_id);
+            }
+        }
+    }
+}
+
+void send_E_REQ() {
+    auto demand = Message(now(), 1, true);
+    E_MY_REQUEST = demand;
+    ELEVATORS_WANTED++;
+    printf("[%s][%s][#%d] %s[%lld]\n", LRED("REQ"), LYELLOW("SND"), MYSELF,
+           RED("REQUESTING ELEVATOR "), demand.timestamp);
+    for (int destination = 0; destination < SIZE; destination++) {
+        if (destination != MYSELF) {
+            MPI_Send(&demand, sizeof(struct Message), MPI_BYTE, destination, E_REQ, MPI_COMM_WORLD);
+            E_PROCESSES_MAP.at(destination).received_ack_from = false;
+        }
+    }
+    ELEVATORS_ACK_ACQUIRED = 0; // since this is a new request, we need to reset ACKS
+}
+
+void send_E_ACK(int process_id) {
+    // send ACK to latest received request from *destination*
+    auto response = Message(E_REQS[process_id].timestamp, true, true);
+    printf("[%s][%s][#%d] %s%d\n", LBLUE("ECK"), LYELLOW("SND"), MYSELF,
+           BLUE("Sending E_ACK to #"), process_id);
+    MPI_Send(&response, sizeof(struct Message), MPI_BYTE, process_id, E_ACK, MPI_COMM_WORLD);
+}
+
+void send_E_RELEASE() {
+    auto demand = Message(now(), E_MY_REQUEST.data, true);
+    ELEVATORS_WANTED--;
+    E_MY_REQUEST = {};
+    printf("[%s][%s][#%d] %s\n", LMAG("ERL"), LYELLOW("SND"), MYSELF, MAG("Sending E_RELEASE"));
+    for (int destination = 0; destination < SIZE; destination++) {
+        if (destination != MYSELF) {
+            MPI_Send(&demand, sizeof(struct Message), MPI_BYTE, destination, E_RELEASE, MPI_COMM_WORLD);
+        }
     }
 }
 
@@ -190,6 +385,14 @@ void send_ACK_to_everyone() {
     for (auto const&[process_id, process] : PROCESSES_MAP) {
         if (process_id != MYSELF) {
             send_ACK(process_id);
+        }
+    }
+}
+
+void send_E_ACK_to_everyone() {
+    for (auto const&[process_id, process] : PROCESSES_MAP) {
+        if (process_id != MYSELF) {
+            send_E_ACK(process_id);
         }
     }
 }
@@ -219,7 +422,7 @@ void check_ACK() {
             ACKS[process_id].dirty = false;
             if (ACKS[process_id].timestamp == MY_REQUEST.timestamp) {
                 printf("[%s][%s][#%d] %s%d!\n", LBLUE("ACK"), LGREEN("RCV"), MYSELF,
-                        LBLUE("Got ACK from #"), process_id);
+                       LBLUE("Got ACK from #"), process_id);
                 PROCESSES_MAP.at(process_id).received_ack_from = ACKS[process_id].data;
                 ACKS_ACQUIRED += REQS[process_id].data;
             }
@@ -231,7 +434,7 @@ void check_RELEASE() {
     for (int process_id = 0; process_id < SIZE; process_id++) {
         if (process_id != MYSELF && RELEASES[process_id].dirty) {
             printf("[%s][%s][#%d] %s=[%d] from #%d!\n", LMAG("RLS"), LGREEN("RCV"), MYSELF,
-                    LMAG("Got RELEASE rooms"), RELEASES[process_id].data, process_id);
+                   LMAG("Got RELEASE rooms"), RELEASES[process_id].data, process_id);
             listen_for(RELEASE, &RELEASES[process_id], process_id, &REQUESTS[RELEASE_OFFSET + process_id]);
             RELEASES[process_id].dirty = false;
             PROCESSES_MAP.at(process_id).rooms -= RELEASES[process_id].data;
@@ -244,7 +447,7 @@ void send_ACK(int destination) {
     // send ACK to latest received request from *destination*
     auto response = Message(REQS[destination].timestamp, true, true);
     printf("[%s][%s][#%d] %s%d\n", LBLUE("ACK"), LYELLOW("SND"), MYSELF,
-            BLUE("Sending ACK to #"), destination);
+           BLUE("Sending ACK to #"), destination);
     MPI_Send(&response, sizeof(struct Message), MPI_BYTE, destination, ACK, MPI_COMM_WORLD);
 }
 
@@ -290,6 +493,14 @@ void init_processes_map() {
     }
 }
 
+
+void init_e_processes_map() {
+    for (int process_id = 0; process_id < SIZE; process_id++) {
+        auto d = ProcessData();
+        E_PROCESSES_MAP.insert({process_id, d});
+    }
+}
+
 void init_requests() {
     REQUESTS.resize(SIZE * 6 + 1);
     for (int i = 0; i < (SIZE * 6) + 1; i++) {
@@ -305,7 +516,8 @@ void init(vector<Message> *messages) {
 }
 
 int at_least_one() {
-    return (rand() % MAX_ROOMS) + 1;
+//    return (rand() % MAX_ROOMS) + 1;
+    return 1;
 }
 
 void sleep_millis(int millis) {
@@ -315,6 +527,10 @@ void sleep_millis(int millis) {
 long long now() {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+bool error_occurred() {
+    return REQUESTS[ERROR] == MPI_REQUEST_NULL || REQUESTS_FINISHED_COUNT == MPI_UNDEFINED;
 }
 
 void timeout() {
@@ -335,13 +551,21 @@ void prepare_timeout_thread() {
 void initialize() {
     srand((unsigned) time(nullptr) + MYSELF);
 
-    ACKS_OFFSET = SIZE;
-    RELEASE_OFFSET = 2 * SIZE;
-    ERROR = SIZE * 3; // index of error message
+    ACKS_OFFSET =           SIZE;
+    RELEASE_OFFSET =    2 * SIZE;
+    E_REQ_OFFSET =      3 * SIZE;
+    E_ACKS_OFFSET =     4 * SIZE;
+    E_RELEASE_OFFSET =  5 * SIZE;
+    ERROR =             6 * SIZE; // index of error message
 
     init(&REQS);
     init(&ACKS);
     init(&RELEASES);
+    init(&E_REQS);
+    init(&E_ACKS);
+    init(&E_RELEASES);
     init_requests();
     init_processes_map();
+    init_e_processes_map();
 }
+

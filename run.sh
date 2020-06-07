@@ -21,13 +21,13 @@ function compileAndRun () {
         echo "#####################################################"
         cd $3
         mpic++ $2 -o algorytm
-        mpirun -hostfile hosts -np $1 algorytm $3
+        mpirun -hostfile ./hosts -np $1 algorytm $3
 ENDCOMPILE
 }
 
-if [ ! -z "$FILE_NAME" ]; then
+if [ -n "$FILE_NAME" ]; then
     echo "Kopiuje plik $FILE_NAME do unixlab..."
-    scp $FILE_NAME $USER@$HOST:~/$WORK_DIRECTORY
+    scp "$FILE_NAME" $USER@$HOST:~/$WORK_DIRECTORY
     if [ "$?" -eq "0" ];
         then 
             connect
