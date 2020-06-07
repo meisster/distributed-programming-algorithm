@@ -207,8 +207,9 @@ void wait_for_room_access() {
         check_ACK();
         check_RELEASE();
         check_REQ();
-        if (can_occupy_rooms()) break;
-        check_E_REQ();
+        auto c = can_occupy_rooms();
+        check_E_REQ(); // fixme
+        if (c) break;
     }
 }
 
@@ -290,9 +291,10 @@ void check_E_RELEASE() {
                    LMAG("Got E_RELEASE"), process_id);
             listen_for(E_RELEASE, &E_RELEASES[process_id], process_id, &REQUESTS[E_RELEASE_OFFSET + process_id]);
             E_RELEASES[process_id].dirty = false;
-            E_PROCESSES_MAP.at(process_id).rooms -= E_RELEASES[process_id].data;
-//            E_PROCESSES_MAP.at(process_id).timestamp = 0;
-            ELEVATORS_WANTED--;
+            E_PROCESSES_MAP.at(process_id).rooms--;
+            printf("[#%d] ELEVATORS_WANTED_BEFORE=%d\n", MYSELF, ELEVATORS_WANTED);
+            ELEVATORS_WANTED -= 1;
+            printf("[#%d] ELEVATORS_WANTED=%d\n", MYSELF, ELEVATORS_WANTED);
         }
     }
 }
@@ -323,7 +325,9 @@ void check_E_REQ() {
             E_REQS[process_id].dirty = false; // mark response as processed
             E_PROCESSES_MAP.at(process_id).rooms = E_REQS[process_id].data;
             E_PROCESSES_MAP.at(process_id).timestamp = E_REQS[process_id].timestamp;
-            ELEVATORS_WANTED++;
+            if (CAN_OCCUPY_ROOMS) {
+                ELEVATORS_WANTED++;
+            }
             if (E_REQS[process_id].timestamp < E_MY_REQUEST.timestamp || !CAN_OCCUPY_ROOMS) {
                 send_E_ACK(process_id);
             }
@@ -356,7 +360,7 @@ void send_E_ACK(int process_id) {
 
 void send_E_RELEASE() {
     auto demand = Message(now(), E_MY_REQUEST.data, true);
-    ELEVATORS_WANTED--;
+    ELEVATORS_WANTED-=1;
     E_MY_REQUEST = {};
     printf("[%s][%s][#%d] %s\n", LMAG("ERL"), LYELLOW("SND"), MYSELF, MAG("Sending E_RELEASE"));
     for (int destination = 0; destination < SIZE; destination++) {
