@@ -61,7 +61,6 @@ struct ProcessData {
 static int MYSELF;
 static int SIZE;
 static bool CAN_OCCUPY_ROOMS = false;
-static bool CAN_OCCUPY_ELEVATOR = false;
 static int ACKS_OFFSET;
 static int RELEASE_OFFSET;
 static int E_REQ_OFFSET;
@@ -123,8 +122,6 @@ void init_requests();
 
 void send_ACK_to_everyone();
 
-int count_ACKS();
-
 void initialize();
 
 void prepare_timeout_thread();
@@ -152,8 +149,6 @@ void use_room();
 void leave_room();
 
 void wait_for_room_access();
-
-void send_E_ACK_to_everyone();
 
 void leave_elevator();
 
@@ -208,7 +203,9 @@ void wait_for_room_access() {
         check_RELEASE();
         check_REQ();
         auto c = can_occupy_rooms();
-        check_E_REQ(); // fixme
+        check_E_REQ();
+        check_E_ACK();
+        check_E_RELEASE();
         if (c) break;
     }
 }
@@ -216,7 +213,6 @@ void wait_for_room_access() {
 void wait_for_elevator_access() {
     int indexes[(SIZE * 6) + 1];
     send_E_REQ();
-//    send_E_ACK_to_everyone();
     while (!error_occurred()) {
         MPI_Waitsome((SIZE * 6) + 1, REQUESTS.data(), &REQUESTS_FINISHED_COUNT, indexes, MPI_STATUSES_IGNORE);
         check_E_REQ();
@@ -325,9 +321,7 @@ void check_E_REQ() {
             E_REQS[process_id].dirty = false; // mark response as processed
             E_PROCESSES_MAP.at(process_id).rooms = E_REQS[process_id].data;
             E_PROCESSES_MAP.at(process_id).timestamp = E_REQS[process_id].timestamp;
-            if (CAN_OCCUPY_ROOMS) {
-                ELEVATORS_WANTED++;
-            }
+            ELEVATORS_WANTED++;
             if (E_REQS[process_id].timestamp < E_MY_REQUEST.timestamp || !CAN_OCCUPY_ROOMS) {
                 send_E_ACK(process_id);
             }
@@ -374,14 +368,6 @@ void send_ACK_to_everyone() {
     for (auto const&[process_id, process] : PROCESSES_MAP) {
         if (process_id != MYSELF) {
             send_ACK(process_id);
-        }
-    }
-}
-
-void send_E_ACK_to_everyone() {
-    for (auto const&[process_id, process] : PROCESSES_MAP) {
-        if (process_id != MYSELF) {
-            send_E_ACK(process_id);
         }
     }
 }
@@ -527,7 +513,7 @@ void timeout() {
     mtx.lock();
     if (!mtx.try_lock_for(chrono::seconds(TIMEOUT))) { // eliminates active wait
         mtx.unlock();
-        printf("[#%d] timeoucik\n", MYSELF);
+        printf("[#%d] Running time exceeded, everything below is jibberish. To extend run time, please increase the TIMEOUT constant\n", MYSELF);
         MPI_Send(&response, sizeof(struct Message), MPI_BYTE, MYSELF, ERROR_CODE, MPI_COMM_WORLD);
     }
 }
