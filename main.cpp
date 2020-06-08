@@ -19,7 +19,7 @@
 #define ERROR_CODE 500
 
 #define MAX_ROOMS 10
-#define TIMEOUT 60
+#define TIMEOUT 16
 #define ELEVATORS 2
 
 struct Message {
@@ -250,7 +250,7 @@ bool can_occupy_elevator() {
             if (!iCanGoIn) break;
         }
     }
-    printf("[INFO][#%d] ELEVATORS_WANTED=%d ELEVATORS_ACK_ACQUIRED=%d iCanGoIn=%d\n", MYSELF, ELEVATORS_WANTED, ELEVATORS_ACK_ACQUIRED, iCanGoIn);
+//    printf("[INFO][#%d] ELEVATORS_WANTED=%d ELEVATORS_ACK_ACQUIRED=%d iCanGoIn=%d\n", MYSELF, ELEVATORS_WANTED, ELEVATORS_ACK_ACQUIRED, iCanGoIn);
     if (ELEVATORS_WANTED - ELEVATORS_ACK_ACQUIRED <= ELEVATORS && iCanGoIn) {
         printf("[INFO][#%d] %s\n", MYSELF, LGREEN("Permission to enter elevator granted!"));
         return true;
@@ -288,9 +288,9 @@ void check_E_RELEASE() {
             listen_for(E_RELEASE, &E_RELEASES[process_id], process_id, &REQUESTS[E_RELEASE_OFFSET + process_id]);
             E_RELEASES[process_id].dirty = false;
             E_PROCESSES_MAP.at(process_id).rooms--;
-            printf("[#%d] ELEVATORS_WANTED_BEFORE=%d\n", MYSELF, ELEVATORS_WANTED);
+//            printf("[#%d] ELEVATORS_WANTED_BEFORE=%d\n", MYSELF, ELEVATORS_WANTED);
             ELEVATORS_WANTED -= 1;
-            printf("[#%d] ELEVATORS_WANTED=%d\n", MYSELF, ELEVATORS_WANTED);
+//            printf("[#%d] ELEVATORS_WANTED=%d\n", MYSELF, ELEVATORS_WANTED);
         }
     }
 }
@@ -322,7 +322,7 @@ void check_E_REQ() {
             E_PROCESSES_MAP.at(process_id).rooms = E_REQS[process_id].data;
             E_PROCESSES_MAP.at(process_id).timestamp = E_REQS[process_id].timestamp;
             ELEVATORS_WANTED++;
-            if (E_REQS[process_id].timestamp < E_MY_REQUEST.timestamp || !CAN_OCCUPY_ROOMS) {
+            if (E_REQS[process_id].timestamp < E_MY_REQUEST.timestamp || !CAN_OCCUPY_ROOMS || E_MY_REQUEST.timestamp == 0) {
                 send_E_ACK(process_id);
             }
         }
